@@ -1,7 +1,7 @@
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, rand
-import mysql.connector  # Pour la connexion à MySQL
+import psycopg2  # Pour la connexion à PostgreSQL
 from datetime import date
 
 # Configuration du SparkSession
@@ -85,11 +85,12 @@ def insert_product_into_db(conn, product):
         cur = conn.cursor()
         cur.execute('''INSERT INTO products (product_name, calories_100g, sodium_100g, sugars_100g, fat_100g, fiber_100g, proteins_100g, nova_group)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                       ON DUPLICATE KEY UPDATE product_id=LAST_INSERT_ID(product_id)''',
+                       ON CONFLICT (product_name) DO UPDATE SET calories_100g = EXCLUDED.calories_100g
+                       RETURNING product_id''',
                     (product['product_name'], product['energy_100g'], product['sodium_100g'], product['sugars_100g'], 
                      product['fat_100g'], product['fiber_100g'], product['proteins_100g'], product['nova_group']))
         conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()[0]
     except Exception as e:
         print(f"Erreur lors de l'insertion du produit dans la base de données : {e}")
         return None
@@ -102,9 +103,9 @@ def insert_menu(conn, user_id, total_calories):
         cur = conn.cursor()
         week_start = date.today()
         cur.execute('''INSERT INTO menus (user_id, week_start_date, total_calories)
-                       VALUES (%s, %s, %s)''', (user_id, week_start, total_calories))
+                       VALUES (%s, %s, %s) RETURNING menu_id''', (user_id, week_start, total_calories))
         conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()[0]
     except Exception as e:
         print(f"Erreur lors de l'insertion du menu dans la base de données : {e}")
         return None
@@ -116,30 +117,28 @@ def insert_user(conn, user_info):
     try:
         cur = conn.cursor()
         cur.execute('''INSERT INTO users (first_name, last_name, age, gender, weight_kg, height_cm, activity_level, diet_id)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING user_id''',
                     (user_info['first_name'], user_info['last_name'], user_info['age'], user_info['gender'],
                      user_info['weight_kg'], user_info['height_cm'], user_info['activity_level'], user_info['diet_id']))
         conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()[0]
     except Exception as e:
         print(f"Erreur lors de l'insertion de l'utilisateur dans la base de données : {e}")
         return None
 
-def insert_daily_meals(conn, menu_id, menu):
+def insert_daily_meals(conn, menu_id, product_id, day, meal_type, meal_info):
     """
-    Insère les repas quotidiens dans la table 'daily_meals' en lien avec le menu_id.
+    Insère les repas quotidiens dans la table 'daily_meals' en lien avec le menu_id et le product_id.
     """
     try:
         cur = conn.cursor()
-        for day, meals in menu.items():
-            for meal in meals:
-                cur.execute('''INSERT INTO daily_meals (menu_id, day_of_week, meal_type, product_name, calories, sugars_100g, fat_100g, proteins_100g, fiber_100g)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''', 
-                            (menu_id, day, meal['meal'], meal['product_name'], meal['energy_100g'], 
-                             meal['sugars_100g'], meal['fat_100g'], meal['proteins_100g'], meal['fiber_100g']))
+        cur.execute('''INSERT INTO daily_meals (menu_id, product_id, day_of_week, meal_type, calories, sugars_100g, fat_100g, proteins_100g, fiber_100g)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''', 
+                    (menu_id, product_id, day, meal_type, meal_info['energy_100g'], 
+                     meal_info['sugars_100g'], meal_info['fat_100g'], meal_info['proteins_100g'], meal_info['fiber_100g']))
         conn.commit()
         cur.close()
-        print("Repas journaliers insérés dans la base de données.")
+        print("Repas journalier inséré dans la base de données.")
     except Exception as e:
         print(f"Erreur lors de l'insertion des repas journaliers dans la base de données : {e}")
 
@@ -185,40 +184,54 @@ def generate_weekly_menu(df, conn, caloric_limit=2000):
         menu[day] = daily_menu
     return menu, total_calories
 
+def insert_diets(conn):
+    """
+    Insère les régimes alimentaires dans la table 'diets'.
+    """
+    try:
+        cur = conn.cursor()
+        diets = [
+            ('vegetarien', 2000, 70, 50, 20, 30, 10),
+            ('cetogene', 2500, 150, 60, 20, 50, 15)
+        ]
+        for diet in diets:
+            cur.execute('''INSERT INTO diets (diet_name, max_calories_per_day, max_fat_per_day, max_proteins_per_day, max_carbs_per_day, max_sugars_per_day, fiber_min_per_day)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING''', diet)
+        conn.commit()
+        cur.close()
+        print("Régimes alimentaires insérés dans la base de données.")
+    except Exception as e:
+        print(f"Erreur lors de l'insertion des régimes alimentaires : {e}")
+
 def main():
     try:
-        conn = mysql.connector.connect(
-            user="root",
-            password="224599574689132",
+        conn = psycopg2.connect(
+            user="postgres",
+            password="postgres",
             host="localhost",
-            database="openfoodfactsmenus",
-            port=3306
+            database="openfoodfact",
+            port="5432"
         )
-    except mysql.connector.Error as e:
+    except psycopg2.Error as e:
         print(f"Erreur lors de la connexion à la base de données : {e}")
         return
     
-    file_path = "en.openfoodfacts.org.products.csv"
+    # Insère les régimes alimentaires avant d'insérer les utilisateurs
+    insert_diets(conn)
+
+    file_path = "data.csv"
 
     df = load_products_from_csv(file_path)
     if df is None:
         return
     
-    # Liste des utilisateurs avec des régimes différents
+    # Exemple d'utilisateurs avec différents régimes
     users = [
-    {'first_name': 'Jean', 'last_name': 'Dupont', 'age': 30, 'gender': 'Male', 'weight_kg': 75, 'height_cm': 180, 'activity_level': 'Moderate', 'diet_id': 1},  # Végétarien
-    {'first_name': 'Marie', 'last_name': 'Lemoine', 'age': 25, 'gender': 'Female', 'weight_kg': 60, 'height_cm': 165, 'activity_level': 'High', 'diet_id': 2},  # Cétogène
-    {'first_name': 'Alexandre', 'last_name': 'Martin', 'age': 45, 'gender': 'Male', 'weight_kg': 90, 'height_cm': 175, 'activity_level': 'Low', 'diet_id': 1},  # Végétarien
-    {'first_name': 'Sophie', 'last_name': 'Bernard', 'age': 35, 'gender': 'Female', 'weight_kg': 68, 'height_cm': 170, 'activity_level': 'Moderate', 'diet_id': 2},  # Cétogène
-    {'first_name': 'Paul', 'last_name': 'Moreau', 'age': 50, 'gender': 'Male', 'weight_kg': 85, 'height_cm': 180, 'activity_level': 'High', 'diet_id': 1},  # Végétarien
-    {'first_name': 'Claire', 'last_name': 'Girard', 'age': 28, 'gender': 'Female', 'weight_kg': 55, 'height_cm': 160, 'activity_level': 'Moderate', 'diet_id': 2},  # Cétogène
-    {'first_name': 'Luc', 'last_name': 'Robert', 'age': 40, 'gender': 'Male', 'weight_kg': 100, 'height_cm': 185, 'activity_level': 'Low', 'diet_id': 2},  # Cétogène
-    {'first_name': 'Emma', 'last_name': 'Petit', 'age': 22, 'gender': 'Female', 'weight_kg': 58, 'height_cm': 165, 'activity_level': 'High', 'diet_id': 1},  # Végétarien
-    {'first_name': 'Thomas', 'last_name': 'Durand', 'age': 38, 'gender': 'Male', 'weight_kg': 77, 'height_cm': 175, 'activity_level': 'Moderate', 'diet_id': 1},  # Végétarien
-    {'first_name': 'Julie', 'last_name': 'Lefevre', 'age': 33, 'gender': 'Female', 'weight_kg': 64, 'height_cm': 168, 'activity_level': 'High', 'diet_id': 2},  # Cétogène
-]
-
-
+        {'first_name': 'Jean', 'last_name': 'Dupont', 'age': 30, 'gender': 'Male', 'weight_kg': 75, 'height_cm': 180, 'activity_level': 'Moderate', 'diet_id': 1},
+        {'first_name': 'Marie', 'last_name': 'Lemoine', 'age': 25, 'gender': 'Female', 'weight_kg': 60, 'height_cm': 165, 'activity_level': 'High', 'diet_id': 2},
+        # Ajoute d'autres utilisateurs ici
+    ]
+    
     for user in users:
         user_id = insert_user(conn, user)
         if user_id is None:
@@ -240,7 +253,9 @@ def main():
             print("Erreur lors de l'insertion du menu.")
             continue
 
-        insert_daily_meals(conn, menu_id, menu)
+        for day, meals in menu.items():
+            for meal in meals:
+                insert_daily_meals(conn, menu_id, meal['product_id'], day, meal['meal'], meal)
 
     conn.close()
 
